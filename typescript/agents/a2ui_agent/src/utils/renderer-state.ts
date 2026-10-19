@@ -25,7 +25,6 @@ import {
   A2uiValidationError,
   CatalogApi,
   ComponentModel,
-  DataModel,
   linkCatalogs,
   MessageProcessor,
   STRICT_VALIDATION,
@@ -63,17 +62,11 @@ const IN_PROGRESS_VALIDATION: ValidationConfig = Object.freeze({
 
 type Message = Record<string, unknown>;
 
-/** A surface as it was before a frame first changed it. */
-interface SurfaceSnapshot {
-  readonly surface: SurfaceModel | undefined;
-  readonly assumed: boolean;
-  readonly changed: ReadonlySet<string> | undefined;
-}
+/** Undoes one change to the state. */
+type Undo = () => void;
 
-/** What a failed `apply` or transaction restores. */
-interface Frame {
-  readonly surfaces: Map<string, SurfaceSnapshot>;
-}
+/** A non-negative array index, as a JSON Pointer segment spells it. */
+const INDEX = /^(0|[1-9][0-9]*)$/;
 
 /**
  * The agent's mirror of the surfaces a renderer holds.
@@ -95,6 +88,12 @@ interface Frame {
  * which is how a response parsed whole is applied all or nothing. A streamed response
  * cannot be rolled back, since the renderer has already received what was emitted.
  *
+ * Being atomic costs what the messages change, not the size of the surfaces they touch.
+ * While an `apply` or a transaction is open, the state keeps an undo log: each message
+ * records what it replaced, and a failure reverts those records, latest first. A deleted
+ * surface is the one change recorded whole, and it is restored by replaying it through the
+ * processor. No surface is copied when a message is applied or a transaction opens.
+ *
  * The state holds the surfaces as they now stand, not the messages that built them.
  *
  * An update to a surface the state never saw created is rejected, as the renderer would
@@ -111,7 +110,10 @@ export class RendererState {
   private readonly assumed = new Set<string>();
   /** The components each surface added or replaced since its tree was last checked. */
   private readonly changed = new Map<string, Set<string>>();
-  private readonly frames: Frame[] = [];
+  /** How to undo each change made since the outermost open `apply` or transaction began. */
+  private readonly log: Undo[] = [];
+  /** How many `apply` calls and transactions are open. */
+  private open = 0;
 
   /**
    * Creates the empty state of a renderer that holds the catalogs.
@@ -166,7 +168,8 @@ export class RendererState {
    * and reachability are left to `checkTopology`, since a component may name a child that a
    * later message adds.
    *
-   * The call is atomic: if a message is rejected, none of them is applied.
+   * The call is atomic: if a message is rejected, none of them is applied. Being atomic
+   * costs what the messages change, not the size of the surfaces they touch.
    *
    * @param payload One message or an iterable of messages, as parsed JSON objects.
    * @returns The ids of the surfaces the messages create, update or delete, in the order the
@@ -228,9 +231,8 @@ export class RendererState {
     for (const surfaceId of ids) {
       // An assumed surface was not checked, so what changed on it stays recorded for the
       // check after it is created.
-      if (!this.assumed.has(surfaceId) && this.changed.get(surfaceId)?.size) {
-        this.save(surfaceId);
-        this.changed.delete(surfaceId);
+      if (!this.assumed.has(surfaceId)) {
+        this.forgetChanged(surfaceId);
       }
     }
   }
@@ -239,7 +241,10 @@ export class RendererState {
    * Runs `fn` and applies everything it applies atomically.
    *
    * If `fn` throws, the state is restored to what it was when the call started, and the
-   * error propagates. `fn` must be synchronous: a transaction cannot span an `await`.
+   * error propagates. Opening a transaction copies nothing, and undoing one costs what was
+   * applied inside it. Transactions nest: an inner transaction that fails restores the state
+   * to where the inner one started, and the outer one goes on. `fn` must be synchronous: a
+   * transaction cannot span an `await`.
    *
    * @returns What `fn` returns.
    * @throws {TypeError} If `fn` returns a promise, which the type of `fn` rejects at compile
@@ -255,60 +260,298 @@ export class RendererState {
     });
   }
 
+  /**
+   * Runs `fn` and undoes what it changed if it throws.
+   *
+   * The frame is a position in the undo log. A failure reverts the log to it, so a failed
+   * inner frame undoes only what was changed inside it. Once the outermost frame ends,
+   * nothing can be undone any more, and the log is cleared.
+   */
   private frame<T>(fn: () => T): T {
-    const frame: Frame = {surfaces: new Map()};
-    this.frames.push(frame);
+    const mark = this.log.length;
+    this.open++;
     try {
       return fn();
     } catch (e) {
-      this.rollback(frame);
+      this.revert(mark);
       throw e;
     } finally {
-      this.frames.pop();
+      this.open--;
+      if (this.open === 0) this.log.length = 0;
     }
   }
 
-  private rollback(frame: Frame): void {
-    const model = this.processor.model;
-    for (const [surfaceId, snapshot] of frame.surfaces) {
-      model.deleteSurface(surfaceId);
-      if (snapshot.surface) {
-        // The snapshot may be shared with an outer frame, so a copy of it goes live and the
-        // snapshot itself stays as it was.
-        model.addSurface(cloneSurface(snapshot.surface));
-      }
-      if (snapshot.assumed) {
-        this.assumed.add(surfaceId);
-      } else {
-        this.assumed.delete(surfaceId);
-      }
-      if (snapshot.changed === undefined) {
-        this.changed.delete(surfaceId);
-      } else {
-        this.changed.set(surfaceId, new Set(snapshot.changed));
-      }
+  /** Undoes the changes logged after a position, latest first. */
+  private revert(mark: number): void {
+    while (this.log.length > mark) {
+      this.log.pop()!();
     }
   }
 
-  /** Snapshots a surface for every open frame, before the surface changes. */
-  private save(surfaceId: string): void {
-    const frames = this.frames.filter(f => !f.surfaces.has(surfaceId));
-    if (frames.length === 0) return;
-    const surface = this.processor.model.getSurface(surfaceId);
+  /** Logs how to undo a change, if an `apply` or transaction is open. */
+  private record(undo: Undo): void {
+    if (this.open > 0) this.log.push(undo);
+  }
+
+  // The state's own bookkeeping. Each change goes through one of these, so that it is
+  // logged.
+
+  private setAssumed(surfaceId: string, assumed: boolean): void {
+    if (this.assumed.has(surfaceId) === assumed) return;
+    if (assumed) {
+      this.assumed.add(surfaceId);
+      this.record(() => this.assumed.delete(surfaceId));
+    } else {
+      this.assumed.delete(surfaceId);
+      this.record(() => this.assumed.add(surfaceId));
+    }
+  }
+
+  /** Records components a surface added or replaced since its tree was last checked. */
+  private noteChanged(surfaceId: string, componentIds: Iterable<string>): void {
+    let changed = this.changed.get(surfaceId);
+    if (!changed) {
+      changed = new Set();
+      this.changed.set(surfaceId, changed);
+      this.record(() => this.changed.delete(surfaceId));
+    }
+    const added: string[] = [];
+    for (const id of componentIds) {
+      if (!changed.has(id)) {
+        changed.add(id);
+        added.push(id);
+      }
+    }
+    if (added.length > 0) {
+      const set = changed;
+      this.record(() => added.forEach(id => set.delete(id)));
+    }
+  }
+
+  /** Stops holding what a surface changed against its next tree check. */
+  private forgetChanged(surfaceId: string): void {
     const changed = this.changed.get(surfaceId);
-    const snapshot: SurfaceSnapshot = {
-      surface: surface ? cloneSurface(surface) : undefined,
-      assumed: this.assumed.has(surfaceId),
-      changed: changed ? new Set(changed) : undefined,
-    };
-    for (const frame of frames) {
-      frame.surfaces.set(surfaceId, snapshot);
-    }
+    if (changed === undefined) return;
+    this.changed.delete(surfaceId);
+    this.record(() => this.changed.set(surfaceId, changed));
   }
 
-  /** Runs messages through the processor. */
-  private process(messages: Message[]): void {
+  /**
+   * Runs one message through the processor, logging what it replaces.
+   *
+   * The processor checks a message whole before it changes a surface, so a rejected message
+   * changes nothing. Should one fail part way all the same, what it changed is undone
+   * before the error propagates.
+   */
+  private process(message: Message): void {
+    const undo = this.undoFor(message);
+    try {
+      this.processUnlogged([message]);
+    } catch (e) {
+      undo?.();
+      throw e;
+    }
+    if (undo) this.record(undo);
+  }
+
+  /** Runs messages through the processor, logging nothing. */
+  private processUnlogged(messages: Message[]): void {
     asValidationError(() => this.processor.processMessages(messages as never));
+  }
+
+  /** Returns how to undo a message, read before it is applied, or nothing to undo. */
+  private undoFor(message: Message): Undo | undefined {
+    const model = this.processor.model;
+    const createBody = bodyOf(message, 'createSurface');
+    if (createBody) {
+      const surfaceId = createBody.surfaceId;
+      if (typeof surfaceId !== 'string' || model.getSurface(surfaceId)) return undefined;
+      return () => model.deleteSurface(surfaceId);
+    }
+    const deleteBody = bodyOf(message, 'deleteSurface');
+    if (deleteBody) {
+      const surfaceId = deleteBody.surfaceId;
+      const surface = typeof surfaceId === 'string' ? model.getSurface(surfaceId) : undefined;
+      return surface ? this.surfaceRestorer(surface) : undefined;
+    }
+    const componentsBody = bodyOf(message, 'updateComponents');
+    if (componentsBody) {
+      return this.componentsRestorer(componentsBody);
+    }
+    const dataBody = bodyOf(message, 'updateDataModel');
+    if (dataBody) {
+      return this.dataModelRestorer(dataBody);
+    }
+    // Function calls and responses change no surface.
+    return undefined;
+  }
+
+  /**
+   * Records the components an `updateComponents` adds or replaces.
+   *
+   * The core updates a component in place when the update keeps its type and catalog, so
+   * the record holds a copy of the component's previous properties, not the object the
+   * update replaces them with.
+   */
+  private componentsRestorer(body: Message): Undo | undefined {
+    const model = this.processor.model;
+    const surfaceId = body.surfaceId;
+    if (typeof surfaceId !== 'string' || !Array.isArray(body.components)) return undefined;
+    const surface = model.getSurface(surfaceId);
+    if (!surface) return undefined;
+    const previous: Array<{
+      id: string;
+      existing: ComponentModel | undefined;
+      properties: Record<string, unknown>;
+      copy: Record<string, unknown>;
+      metadata: Record<string, unknown> | undefined;
+    }> = [];
+    for (const component of body.components as unknown[]) {
+      const id = (component as Message | null)?.id;
+      if (typeof id !== 'string') continue;
+      const existing = surface.componentsModel.get(id);
+      previous.push({
+        id,
+        existing,
+        properties: existing?.properties ?? {},
+        copy: existing ? structuredClone(existing.properties) : {},
+        metadata: existing ? structuredClone(existing.metadata) : undefined,
+      });
+    }
+    if (previous.length === 0) return undefined;
+    return () => {
+      // Found again by id: undoing a later delete replays the surface into new objects.
+      const components = model.getSurface(surfaceId)?.componentsModel;
+      if (!components) return;
+      for (const {id, existing, properties, copy, metadata} of previous.reverse()) {
+        const current = components.get(id);
+        if (!existing) {
+          components.removeComponent(id);
+        } else if (current === existing) {
+          // Left as it was when the message failed before changing it.
+          if (current.properties === properties) continue;
+          current.metadata = metadata;
+          current.properties = copy;
+        } else {
+          // The update replaced the component with one of another type or catalog, and the
+          // core disposed of the old one.
+          components.removeComponent(id);
+          components.addComponent(
+            new ComponentModel(id, existing.type, copy, existing.catalog, metadata),
+          );
+        }
+      }
+    };
+  }
+
+  /**
+   * Records the data model value an `updateDataModel` replaces.
+   *
+   * Setting a path creates the containers above it that are missing, and pads a list up to
+   * the index it sets, so the record is taken at the first segment of the path that does not
+   * hold a container yet. The value there is replaced, not changed in place, and every later
+   * change to it has a record of its own, so the record holds the value itself.
+   */
+  private dataModelRestorer(body: Message): Undo | undefined {
+    const model = this.processor.model;
+    const surfaceId = body.surfaceId;
+    if (typeof surfaceId !== 'string') return undefined;
+    const surface = model.getSurface(surfaceId);
+    if (!surface) return undefined;
+    const path = typeof body.path === 'string' ? body.path : '/';
+    const tokens = pointerTokens(path);
+    const root: unknown = surface.dataModel.get('/');
+    if (tokens.length === 0) {
+      return () => model.getSurface(surfaceId)?.dataModel.set('/', root);
+    }
+    let parent: unknown = root;
+    for (let depth = 0; depth < tokens.length; depth++) {
+      if (!parent || typeof parent !== 'object') return undefined;
+      const token = tokens[depth];
+      const [exists, child] = childOf(parent, token);
+      if (exists && depth < tokens.length - 1 && child && typeof child === 'object') {
+        parent = child;
+        continue;
+      }
+      const parentTokens = tokens.slice(0, depth);
+      const length = Array.isArray(parent) ? parent.length : 0;
+      return () => {
+        const dataModel = model.getSurface(surfaceId)?.dataModel;
+        if (!dataModel) return;
+        const parentPath = toPointer(parentTokens);
+        const container: unknown = dataModel.get(parentPath);
+        if (!container || typeof container !== 'object') return;
+        if (Array.isArray(container)) {
+          if (exists) {
+            container[Number(token)] = child;
+          } else {
+            container.length = length;
+          }
+        } else if (exists) {
+          (container as Message)[token] = child;
+        } else {
+          delete (container as Message)[token];
+        }
+        // Setting the container to itself tells the model's subscribers it changed.
+        dataModel.set(parentPath, container);
+      };
+    }
+    return undefined;
+  }
+
+  /**
+   * Records a surface that a message deletes, whole.
+   *
+   * It is restored by replaying it through the processor. A component whose catalog is not
+   * the surface's default names its own, so a surface whose components come from several
+   * catalogs comes back as it was. The properties and the data model are copied, since the
+   * surface is disposed of once deleted.
+   */
+  private surfaceRestorer(surface: SurfaceModel): Undo {
+    const surfaceId = surface.id;
+    const defaultCatalog = surface.defaultCatalog;
+    const theme = surface.theme as Message | undefined;
+    const operations: Message[] = [
+      {
+        type: 'createSurface',
+        surfaceId,
+        catalogId: defaultCatalog?.id,
+        theme: theme && Object.keys(theme).length > 0 ? structuredClone(theme) : undefined,
+        sendDataModel: surface.sendDataModel,
+        rootId: surface.rootId,
+        metadata: structuredClone(surface.metadata),
+        version: surface.protocolVersion,
+      },
+    ];
+    const components: Message[] = [];
+    for (const component of surface.componentsModel.values) {
+      const item: Message = {
+        ...structuredClone(component.properties),
+        id: component.id,
+        component: component.type,
+      };
+      if (component.metadata !== undefined) item.metadata = structuredClone(component.metadata);
+      if (component.catalog !== defaultCatalog) item.catalogId = component.catalog.id;
+      components.push(item);
+    }
+    if (components.length > 0) {
+      operations.push({type: 'updateComponents', surfaceId, components});
+    }
+    const data: unknown = surface.dataModel.get('/');
+    if (data && typeof data === 'object' && Object.keys(data).length > 0) {
+      operations.push({
+        type: 'updateDataModel',
+        surfaceId,
+        path: '/',
+        value: structuredClone(data),
+      });
+    }
+    return () => {
+      if (this.processor.model.getSurface(surfaceId)) return;
+      for (const op of operations) {
+        this.processor.processOperation(op as never);
+      }
+    };
   }
 
   /** Applies the message at `index` and returns the surface it targets, if any. */
@@ -316,35 +559,27 @@ export class RendererState {
     const message = payload[index];
     const [surfaceId, creates] = target(message);
     if (surfaceId === undefined) {
-      this.process([message]);
+      this.process(message);
       return undefined;
     }
 
-    this.save(surfaceId);
     const deletes = 'deleteSurface' in message;
     if (creates) {
-      this.process([message]);
+      this.process(message);
     } else if (deletes) {
-      this.process([message]);
-      this.assumed.delete(surfaceId);
-      this.changed.delete(surfaceId);
+      this.process(message);
+      this.setAssumed(surfaceId, false);
+      this.forgetChanged(surfaceId);
     } else if (
       !this.processor.model.getSurface(surfaceId) &&
       this.assumes(surfaceId, payload, index)
     ) {
       this.assumeSurface(surfaceId, payload, index);
     } else {
-      this.process([message]);
+      this.process(message);
     }
     if (!deletes) {
-      let changed = this.changed.get(surfaceId);
-      if (!changed) {
-        changed = new Set();
-        this.changed.set(surfaceId, changed);
-      }
-      for (const id of componentIds(message)) {
-        changed.add(id);
-      }
+      this.noteChanged(surfaceId, componentIds(message));
     }
     return surfaceId;
   }
@@ -397,7 +632,8 @@ export class RendererState {
         createSurface: {surfaceId, catalogId: catalog.id},
       };
       try {
-        this.process([placeholder, ...updates]);
+        // A trial on a surface deleted right after, which needs no undo.
+        this.processUnlogged([placeholder, ...updates]);
       } catch (e) {
         if (!(e instanceof A2uiValidationError)) throw e;
         errors.push(e);
@@ -405,8 +641,9 @@ export class RendererState {
       } finally {
         this.processor.model.deleteSurface(surfaceId);
       }
-      this.process([placeholder, message]);
-      this.assumed.add(surfaceId);
+      this.process(placeholder);
+      this.process(message);
+      this.setAssumed(surfaceId, true);
       return;
     }
     throw errors[0];
@@ -466,33 +703,6 @@ function asValidationError<T>(fn: () => T): T {
     if (e instanceof A2uiValidationError || !(e instanceof A2uiError)) throw e;
     throw new A2uiValidationError(e.message, (e as {details?: unknown}).details);
   }
-}
-
-/** Copies a surface's state into a new surface that shares its catalogs. */
-function cloneSurface(surface: SurfaceModel): SurfaceModel {
-  const clone = new SurfaceModel(
-    surface.id,
-    surface.defaultCatalog,
-    surface.availableCatalogs,
-    structuredClone(surface.theme),
-    surface.sendDataModel,
-    new DataModel(structuredClone(surface.dataModel.get('/') ?? {})),
-    surface.rootId,
-    structuredClone(surface.metadata),
-    surface.protocolVersion,
-  );
-  for (const component of surface.componentsModel.values) {
-    clone.componentsModel.addComponent(
-      new ComponentModel(
-        component.id,
-        component.type,
-        structuredClone(component.properties),
-        component.catalog,
-        structuredClone(component.metadata),
-      ),
-    );
-  }
-  return clone;
 }
 
 function isObjectIterable(value: unknown): value is Iterable<unknown> {
@@ -588,4 +798,35 @@ function componentTypes(messages: Message[]): Set<string> {
     }
   }
   return types;
+}
+
+/** Returns the body of a message's action, if the message holds that action. */
+function bodyOf(message: Message, action: string): Message | undefined {
+  const body = message[action];
+  return body && typeof body === 'object' && !Array.isArray(body) ? (body as Message) : undefined;
+}
+
+/** Splits a JSON Pointer into its unescaped segments, as `DataModel` does. */
+function pointerTokens(path: string): string[] {
+  return path
+    .split('/')
+    .filter(token => token.length > 0)
+    .map(token => token.replace(/~1/g, '/').replace(/~0/g, '~'));
+}
+
+/** Joins segments into a JSON Pointer. */
+function toPointer(tokens: string[]): string {
+  return '/' + tokens.map(token => token.replace(/~/g, '~0').replace(/\//g, '~1')).join('/');
+}
+
+/** Returns whether a container holds a segment of a path, and its value. */
+function childOf(container: object, token: string): [boolean, unknown] {
+  if (Array.isArray(container)) {
+    if (!INDEX.test(token)) return [false, undefined];
+    const index = Number(token);
+    return index < container.length ? [true, container[index]] : [false, undefined];
+  }
+  return Object.prototype.hasOwnProperty.call(container, token)
+    ? [true, (container as Message)[token]]
+    : [false, undefined];
 }

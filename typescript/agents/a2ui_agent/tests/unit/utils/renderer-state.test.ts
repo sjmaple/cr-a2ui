@@ -20,6 +20,7 @@ import {
   A2uiCatalogError,
   A2uiIntegrityError,
   A2uiValidationError,
+  InMemoryCatalogProvider,
   RendererState,
   validatePayload,
 } from '../../../src/index.js';
@@ -266,7 +267,7 @@ describe('RendererState', () => {
     expect(componentIds(state)).toEqual(['a', 'root']);
   });
 
-  it('restores the outer snapshot after nested rollbacks', () => {
+  it('restores the state from before the outer transaction after nested rollbacks', () => {
     const state = canvas();
 
     expect(() =>
@@ -299,4 +300,173 @@ describe('RendererState', () => {
 
     expect(state.getSurface('s')?.dataModel.get('/')).toEqual({name: 'Ada'});
   });
+
+  it('restores the state where a failed inner transaction started, and the outer goes on', () => {
+    const state = canvas();
+
+    state.transaction(() => {
+      state.apply(update(text('a', 'Outer')));
+      expect(() =>
+        state.transaction(() => {
+          state.apply(update(text('a', 'Inner'), text('b')));
+          state.apply(DATA('/name', 'Inner'));
+          state.apply(update({id: 'x', component: 'Unknown'}));
+        }),
+      ).toThrow(A2uiValidationError);
+      expect(textOf(state, 'a')).toBe('Outer');
+      state.apply(update(column(['a', 'c']), text('c')));
+    });
+
+    expect(componentIds(state)).toEqual(['a', 'c', 'root']);
+    expect(textOf(state, 'a')).toBe('Outer');
+    expect(state.getSurface('s')?.dataModel.get('/')).toEqual({});
+  });
+
+  it('undoes an update in place without copying the surface', () => {
+    const state = canvas();
+    const surface = state.getSurface('s');
+    const component = surface?.componentsModel.get('a');
+    const before = snapshot(state);
+
+    expect(() =>
+      state.transaction(() => {
+        state.apply(update(text('a', 'Changed')));
+        state.apply(update(text('a', 'Changed again')));
+        state.apply(update({id: 'x', component: 'Unknown'}));
+      }),
+    ).toThrow(A2uiValidationError);
+
+    // The same objects hold the state: rollback undid the updates rather than swapping in a
+    // copy of the surface.
+    expect(state.getSurface('s')).toBe(surface);
+    expect(state.getSurface('s')?.componentsModel.get('a')).toBe(component);
+    expect(snapshot(state)).toEqual(before);
+  });
+
+  it('undoes an update that changes a component type', () => {
+    const state = canvas();
+    const before = snapshot(state);
+
+    expect(() =>
+      state.transaction(() => {
+        state.apply(update({id: 'a', component: 'Divider'}));
+        state.apply(update({id: 'x', component: 'Unknown'}));
+      }),
+    ).toThrow(A2uiValidationError);
+
+    expect(snapshot(state)).toEqual(before);
+    expect(state.getSurface('s')?.componentsModel.get('a')?.type).toBe('Text');
+  });
+
+  it('restores a surface that was deleted and created again', () => {
+    const state = canvas();
+    state.apply(DATA('/items', ['x', 'y']));
+    const before = snapshot(state);
+
+    expect(() =>
+      state.transaction(() => {
+        state.apply(update(text('a', 'Before delete')));
+        state.apply([DELETE, CREATE, update(column(['n']), text('n'))]);
+        state.apply(DATA('/items/5', 'z'));
+        state.apply(update({id: 'x', component: 'Unknown'}));
+      }),
+    ).toThrow(A2uiValidationError);
+
+    expect(snapshot(state)).toEqual(before);
+    // The restored surface keeps checking what changed against the tree.
+    expect(() => turn(state, update(text('orphan')))).toThrow(A2uiIntegrityError);
+  });
+
+  it('undoes data model writes that create containers and pad lists', () => {
+    const state = canvas();
+    state.apply(DATA('/', {list: ['a'], nested: {kept: 1}}));
+    const before = structuredClone(state.getSurface('s')?.dataModel.get('/'));
+
+    expect(() =>
+      state.transaction(() => {
+        state.apply(DATA('/list/3', 'd'));
+        state.apply(DATA('/nested/kept', 2));
+        state.apply(DATA('/fresh/deep/path', true));
+        state.apply(DATA('/nested', null));
+        state.apply(update({id: 'x', component: 'Unknown'}));
+      }),
+    ).toThrow(A2uiValidationError);
+
+    expect(state.getSurface('s')?.dataModel.get('/')).toEqual(before);
+    expect(state.getSurface('s')?.dataModel.get('/list')).toHaveLength(1);
+  });
+
+  it('restores what a tree check marked checked when the transaction fails', () => {
+    const state = canvas();
+    // Not reachable yet, so the next tree check of the surface holds it to that.
+    state.apply(update(text('b')));
+
+    expect(() =>
+      state.transaction(() => {
+        turn(state, update(column(['a', 'b'])));
+        throw new Error('the response failed later');
+      }),
+    ).toThrow('the response failed later');
+
+    expect(() => state.checkTopology(['s'])).toThrow(A2uiIntegrityError);
+  });
+
+  it('restores the components of a v1.0 surface from several catalogs', () => {
+    const primary = v10Catalog('urn:primary', 'Panel');
+    const extra = v10Catalog('urn:extra', 'Badge');
+    const state = new RendererState([primary, extra]);
+    state.apply([
+      {version: 'v1.0', createSurface: {surfaceId: 's', catalogId: 'urn:primary'}},
+      {
+        version: 'v1.0',
+        updateComponents: {
+          surfaceId: 's',
+          components: [
+            {id: 'root', component: 'Panel', text: 'Hi'},
+            {id: 'b', component: 'Badge', text: 'New', catalogId: 'urn:extra'},
+          ],
+        },
+      },
+    ]);
+    const catalogOf = (id: string) => state.getSurface('s')?.componentsModel.get(id)?.catalog.id;
+
+    expect(() =>
+      state.transaction(() => {
+        state.apply({version: 'v1.0', deleteSurface: {surfaceId: 's'}});
+        state.apply({version: 'v1.0', deleteSurface: {surfaceId: 'missing'}});
+        state.apply({
+          version: 'v1.0',
+          updateComponents: {surfaceId: 's', components: [{id: 'root', component: 'Panel'}]},
+        });
+      }),
+    ).toThrow(A2uiValidationError);
+
+    expect(componentIds(state)).toEqual(['b', 'root']);
+    expect(catalogOf('root')).toBe('urn:primary');
+    expect(catalogOf('b')).toBe('urn:extra');
+  });
 });
+
+function DATA(path: string, value: unknown): Message {
+  return {version: 'v0.9', updateDataModel: {surfaceId: 's', path, value}};
+}
+
+/** A v1.0 catalog whose components each require a `text` string. */
+function v10Catalog(catalogId: string, ...components: string[]) {
+  return new InMemoryCatalogProvider(
+    {
+      catalogId,
+      components: Object.fromEntries(
+        components.map(name => [
+          name,
+          {
+            type: 'object',
+            properties: {component: {const: name}, text: {type: 'string'}},
+            required: ['component', 'text'],
+          },
+        ]),
+      ),
+    },
+    'v1.0',
+  ).load();
+}

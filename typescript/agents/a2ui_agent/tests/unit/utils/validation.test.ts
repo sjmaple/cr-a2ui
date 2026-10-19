@@ -129,11 +129,17 @@ describe('validatePayload', () => {
     );
   });
 
-  it('accepts an empty payload and rejects one that is not an array', () => {
+  it('accepts an empty payload', () => {
     validatePayload([BASIC], []);
-    expect(() => validatePayload([BASIC], {} as unknown as unknown[])).toThrow(
-      'Payload is not a JSON array.',
+  });
+
+  it('accepts one message on its own', () => {
+    validatePayload([BASIC], update(COLUMN));
+    expect(() => validatePayload([BASIC], update({id: 'x', component: 'Unknown'}))).toThrow(
+      A2uiValidationError,
     );
+    expect(() => validatePayload([BASIC], {})).toThrow('Message 0 states no version');
+    expect(() => validatePayload([BASIC], 'nope')).toThrow('Message 0 is not a JSON object.');
   });
 
   it('rejects a message that is not an object', () => {

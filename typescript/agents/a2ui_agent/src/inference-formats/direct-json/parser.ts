@@ -93,7 +93,8 @@ export class DirectJsonParser extends Parser {
       validatePayload(this.catalogs, jsonData);
     }
 
-    return jsonData as AgentToRendererMessage[];
+    // A block may hold one message on its own.
+    return (Array.isArray(jsonData) ? jsonData : [jsonData]) as AgentToRendererMessage[];
   }
 
   // Streaming needs an injected stream processor.
