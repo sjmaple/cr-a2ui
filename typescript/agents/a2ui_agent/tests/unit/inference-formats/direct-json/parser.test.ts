@@ -135,7 +135,9 @@ describe('DirectJsonParser', () => {
           new Catalog('https://a2ui.org/catalogs/custom', version, [], []),
         ];
         expect(new DirectJsonParser(catalogs).catalogs).toEqual(catalogs);
-        expect(new DirectJsonFormatFactory().createFormat(catalogs).catalogs).toEqual(catalogs);
+        const formatParser = new DirectJsonFormatFactory().createFormat(catalogs).createParser();
+        expect(formatParser).toBeInstanceOf(DirectJsonParser);
+        expect((formatParser as DirectJsonParser).catalogs).toEqual(catalogs);
       },
     );
 
@@ -145,7 +147,9 @@ describe('DirectJsonParser', () => {
         new Catalog('https://a2ui.org/catalogs/custom', 'v0.9.1', [], []),
       ];
       expect(new DirectJsonParser(catalogs).catalogs).toEqual(catalogs);
-      expect(new DirectJsonFormatFactory().createFormat(catalogs).catalogs).toEqual(catalogs);
+      const formatParser = new DirectJsonFormatFactory().createFormat(catalogs).createParser();
+      expect(formatParser).toBeInstanceOf(DirectJsonParser);
+      expect((formatParser as DirectJsonParser).catalogs).toEqual(catalogs);
     });
 
     it('throws A2uiValidationError on missing version', () => {
