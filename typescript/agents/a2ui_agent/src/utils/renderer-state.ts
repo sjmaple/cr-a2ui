@@ -31,8 +31,9 @@ import {
   SurfaceModel,
   ValidationConfig,
 } from '../internal/web-core.js';
-import {validateEnvelope} from './envelope-validation.js';
 import {checkParserCatalogs} from './catalog-checks.js';
+import {validateEnvelope} from './envelope-validation.js';
+import {toReleaseLine} from './protocol-version.js';
 
 /**
  * The `version` values that messages for each release line's catalogs state, spelled as
@@ -127,7 +128,7 @@ export class RendererState {
     if (!catalogs || catalogs.length === 0) {
       throw new A2uiCatalogError('A renderer state requires at least one catalog.');
     }
-    this.releaseLine = releaseLineOf(checkParserCatalogs(catalogs));
+    this.releaseLine = toReleaseLine(checkParserCatalogs(catalogs));
     this._catalogs = linkCatalogs(catalogs);
     this.processor = new MessageProcessor(this._catalogs as never, undefined, {
       validationConfig: IN_PROGRESS_VALIDATION,
@@ -688,11 +689,6 @@ export class RendererState {
       `Message ${index} states version '${String(stated)}', but the catalogs target ${this.releaseLine}, whose messages state ${quoted}.`,
     );
   }
-}
-
-/** The release line of a wire protocol version: v0.9.1 shares v0.9's. */
-function releaseLineOf(wireVersion: string): string {
-  return wireVersion === 'v0.9.1' ? 'v0.9' : wireVersion;
 }
 
 function isPromiseLike(value: unknown): value is PromiseLike<unknown> {

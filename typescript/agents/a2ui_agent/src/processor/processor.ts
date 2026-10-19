@@ -20,7 +20,7 @@ import {A2uiCatalogError, AgentToRendererMessage, CatalogApi} from '../internal/
 import {ParseOptions, Parser} from '../parser/parser.js';
 import {ResponsePart} from '../parser/response-part.js';
 import {ResponseStream} from '../parser/response-stream.js';
-import {toWireProtocolVersion} from '../utils/protocol-version.js';
+import {toReleaseLine, toWireProtocolVersion} from '../utils/protocol-version.js';
 import {RendererState} from '../utils/renderer-state.js';
 
 /** Options for a request processor. */
@@ -145,7 +145,7 @@ export class A2uiRequestProcessor {
    * doesn't.
    */
   acceptsState(state: RendererState): boolean {
-    return describeCatalogs(state.catalogs) === describeCatalogs(this.catalogs);
+    return catalogsKey(state.catalogs) === catalogsKey(this.catalogs);
   }
 
   private checkState(state: RendererState | undefined): void {
@@ -154,6 +154,15 @@ export class A2uiRequestProcessor {
       `The renderer state holds catalogs [${describeCatalogs(state.catalogs)}], but the processor's active catalogs are [${describeCatalogs(this.catalogs)}].`,
     );
   }
+}
+
+/**
+ * The id and release line of each catalog, in order, to compare two lists of catalogs. A
+ * v0.9 and a v0.9.1 catalog with the same id compare equal, since a `RendererState` treats
+ * the two versions as one.
+ */
+function catalogsKey(catalogs: CatalogApi[]): string {
+  return JSON.stringify(catalogs.map(c => [c.id, toReleaseLine(c.protocolVersion)]));
 }
 
 /** The id and normalized protocol version of each catalog, in order. */

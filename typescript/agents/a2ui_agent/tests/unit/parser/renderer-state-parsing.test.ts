@@ -523,6 +523,19 @@ describe('A2uiRequestProcessor with a renderer state', () => {
     expect(processor.acceptsState(new RendererState([BASIC]))).toBe(false);
   });
 
+  it('accepts a state for the v0.9.1 spelling of the same catalogs', () => {
+    const v091 = loadBasicCatalog('v0.9.1');
+    const processor = new A2uiRequestProcessor([BASIC]);
+
+    expect(v091.id).toBe(BASIC.id);
+    expect(processor.acceptsState(new RendererState([v091]))).toBe(true);
+    expect(new A2uiRequestProcessor([v091]).acceptsState(processor.createState())).toBe(true);
+    expect(
+      () =>
+        new A2uiRequestProcessor([BASIC], undefined, undefined, {state: new RendererState([v091])}),
+    ).not.toThrow();
+  });
+
   it('reuses one parser', () => {
     const processor = new A2uiRequestProcessor([BASIC]);
 
