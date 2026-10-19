@@ -104,4 +104,10 @@ yarn workspace @a2ui/agent lint
 yarn workspace @a2ui/agent format
 ```
 
+The timing suites of the conformance tests, `conformance/agent/direct_json/scaling.yaml` and `conformance/agent/express/scaling.yaml`, check that parsing and streaming a response take time in proportion to its size. Times depend on the machine, so `test` leaves them out. Run them on their own:
+
+```sh
+yarn workspace @a2ui/agent test:timing
+```
+
 Architecture, design decisions, and parser regeneration instructions live in the [codebase blueprint](../../../blueprints/codebases/typescript/agents/a2ui_agent/codebase.blueprint.md).
